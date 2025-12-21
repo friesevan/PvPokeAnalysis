@@ -5,10 +5,35 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
 import requests
+from datetime import datetime
 
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def get_commit_date(repo_owner, repo_name, commit_sha):
+    """
+    Returns the ISO date string of a specific commit.
+    """
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits/{commit_sha}"
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+    return data["commit"]["committer"]["date"]  # ISO 8601 format, e.g., "2025-12-21T18:22:03Z"
+
+
+def get_latest_commit_info(repo_owner, repo_name, path):
+    """
+    Returns the SHA and date of the latest commit for a given file path in ISO format.
+    """
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits"
+    params = {"path": path, "per_page": 1}  # Only need the latest commit
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    data = response.json()[0]  # Latest commit is first
+    sha = data["sha"]
+    date_iso = data["commit"]["committer"]["date"]  # ISO 8601 string
+    return sha, date_iso
 
 def get_commit_sha(repo_owner, repo_name, until_date, path=None, branch="master"):
     """
@@ -279,17 +304,11 @@ def process_league(league, seasons, updates, pokemon_map, xl_table,
 
     return pd.DataFrame(rows)
 
-def append_average_row(ws, df, label_col=1):
-    """
-    Appends an average row for Old Ranking, Ranking, Difference
-    """
+def append_average_row(ws, df, label_col=1, header_row=2):
     avg_row = ws.max_row + 1
-
     ws.cell(row=avg_row, column=label_col, value="Average")
     ws.cell(row=avg_row, column=label_col).font = Font(bold=True)
-
-    headers = [c.value for c in ws[1]]
-
+    headers = [c.value for c in ws[header_row]]
     for col_name in ["Old Ranking", "Ranking", "Difference"]:
         if col_name in headers:
             col_idx = headers.index(col_name) + 1
@@ -329,35 +348,46 @@ def main(previous_date=None):
     moves_data = load_json_from_github(moves_url) 
     rankings_current = {league: load_json_from_github(url) for league, url in rankings_urls.items()}
 
+    # Latest commit date (we assume master branch latest)
+    latest_commit_sha, latest_commit_date_iso = get_latest_commit_info(
+        repo_owner="pvpoke",
+        repo_name="pvpoke",
+        path="src/data/gamemaster/pokemon.json"
+    )
+    latest_commit_date = datetime.strptime(latest_commit_date_iso[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+
+    previous_commit_date = None
+    rankings_prev = {}
     if previous_date:
-        previous_commit = get_commit_sha(
+        previous_commit_sha = get_commit_sha(
             repo_owner="pvpoke",
             repo_name="pvpoke",
             until_date=previous_date,
             path="src/data/gamemaster/pokemon.json"
         )
-        print("Previous commit SHA:", previous_commit)
+        # Pull actual commit date for previous SHA
+        previous_commit_date_iso = get_commit_date(
+            repo_owner="pvpoke",
+            repo_name="pvpoke",
+            commit_sha=previous_commit_sha
+        )
+        previous_commit_date = datetime.strptime(previous_commit_date_iso[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
 
-        pokemon_prev = load_json_from_commit(
-            "src/data/gamemaster/pokemon.json",
-            previous_commit
-        )
-        moves_prev = load_json_from_commit(
-            "src/data/gamemaster/moves.json",
-            previous_commit
-        )
+        pokemon_prev = load_json_from_commit("src/data/gamemaster/pokemon.json", previous_commit_sha)
+        moves_prev   = load_json_from_commit("src/data/gamemaster/moves.json", previous_commit_sha)
         rankings_prev = {
             league: load_json_from_commit(
                 f"src/data/rankings/all/overall/rankings-{suffix}.json",
-                previous_commit
+                previous_commit_sha
             )
             for league, suffix in [("Great", "1500"), ("Ultra", "2500"), ("Master", "10000")]
         }
     else:
-        # If no previous commit, use current data as previous
+        previous_commit_date = latest_commit_date  # if no previous, same as latest
         pokemon_prev = pokemon_data
-        moves_prev = moves_data
+        moves_prev   = moves_data
         rankings_prev = rankings_current
+
 
     # ----------------------------
     # Build lookup tables
@@ -441,13 +471,21 @@ def main(previous_date=None):
             df_sorted.to_excel(writer, sheet_name=sheet_pokemon, index=False)
             ws = writer.sheets[sheet_pokemon]
 
-            # Format headers
-            for cell in ws[1]:
+            # --- Add date range header above the column headers ---
+            ws.insert_rows(1)  # insert new first row
+            header_range = f"A1:{get_column_letter(ws.max_column)}1"
+            ws.merge_cells(header_range)
+            ws["A1"].value = f"{league} – Pokemon – {previous_commit_date} to {latest_commit_date}"
+            ws["A1"].font = Font(bold=True, size=14)
+            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+            # Format actual headers (row 2)
+            for cell in ws[2]:
                 cell.font = Font(bold=True, size=12)
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-            # Bold Pokémon names
-            for cell in ws["A"][1:]:
+            # Bold Pokémon names (now in row 3+)
+            for cell in ws["A"][2:]:
                 cell.font = Font(bold=True, size=12)
 
             # Auto-fit columns
@@ -457,54 +495,61 @@ def main(previous_date=None):
                 for cell in col_cells:
                     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-            # Filters
-            ws.auto_filter.ref = ws.dimensions
-            append_average_row(ws, df_sorted)
+            # Filters on row 2
+            ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{ws.max_row}"
 
-            # Conditional formatting for numeric columns
-            headers = [c.value for c in ws[1]]
+            # Conditional formatting: use row 3+ for data
+            headers = [c.value for c in ws[2]]
             for col_name in ["Old Ranking", "Ranking", "Difference"]:
                 if col_name in headers:
                     col_letter = get_column_letter(headers.index(col_name) + 1)
+                    start_row = 3
                     if col_name == "Difference":
                         ws.conditional_formatting.add(
-                            f"{col_letter}2:{col_letter}{ws.max_row}",
+                            f"{col_letter}{start_row}:{col_letter}{ws.max_row}",
                             ColorScaleRule(start_type='num', start_value=-10, start_color='FF0000',
-                                           mid_type='num', mid_value=0, mid_color='FFFF00',
-                                           end_type='num', end_value=10, end_color='00FF00')
+                                        mid_type='num', mid_value=0, mid_color='FFFF00',
+                                        end_type='num', end_value=10, end_color='00FF00')
                         )
                     else:
                         ws.conditional_formatting.add(
-                            f"{col_letter}2:{col_letter}{ws.max_row}",
+                            f"{col_letter}{start_row}:{col_letter}{ws.max_row}",
                             ColorScaleRule(start_type='min', start_color='FF0000',
-                                           mid_type='percentile', mid_value=50, mid_color='FFFF00',
-                                           end_type='max', end_color='00FF00')
+                                        mid_type='percentile', mid_value=50, mid_color='FFFF00',
+                                        end_type='max', end_color='00FF00')
                         )
+
+            # Append average row (after last row)
+            append_average_row(ws, df_sorted, header_row=2)
+
             
             new_move_fill = PatternFill(start_color="A8D5BA", end_color="A8D5BA", fill_type="solid")   # soft green
             rework_fill   = PatternFill(start_color="C6A3C6", end_color="C6A3C6", fill_type="solid")   # muted purple
             buff_fill     = PatternFill(start_color="A3C4F3", end_color="A3C4F3", fill_type="solid")   # muted blue
             nerf_fill     = PatternFill(start_color="F4A3A3", end_color="F4A3A3", fill_type="solid")   # soft red
 
-            # Highlight moves with debug prints
+            # Highlight moves with debug prints (adjusted for date header)
             for row_idx, row in df_sorted.iterrows():
                 styled_cols = set()
 
                 # Normalize all move column values
                 move_values = {col: normalize_move(row.get(col, "")) for col in ["Fast Move", "Charged Move 1", "Charged Move 2"]}
 
+                # Data now starts at Excel row 3 because of date header + header row
+                excel_row = row_idx + 3
+
                 # 2. Buffed moves (blue)
                 for move in [normalize_move(m) for m in row.get("Buffs", "").split(",") if m.strip()]:
                     for move_col, cell_value in move_values.items():
                         if cell_value == move:
-                            ws.cell(row=row_idx + 2, column=df_sorted.columns.get_loc(move_col) + 1).fill = buff_fill
+                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = buff_fill
                             styled_cols.add(move_col)
-                
+
                 # 1. Newly added moves (green + bold)
                 for move in [normalize_move(m) for m in row.get("Attack Availability", "").split(",") if m.strip()]:
                     for move_col, cell_value in move_values.items():
                         if cell_value == move:
-                            cell = ws.cell(row=row_idx + 2, column=df_sorted.columns.get_loc(move_col) + 1)
+                            cell = ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1)
                             cell.fill = new_move_fill
                             cell.font = Font(bold=True)
                             styled_cols.add(move_col)
@@ -513,14 +558,14 @@ def main(previous_date=None):
                 for move in [normalize_move(m) for m in row.get("Nerfs", "").split(",") if m.strip()]:
                     for move_col, cell_value in move_values.items():
                         if cell_value == move:
-                            ws.cell(row=row_idx + 2, column=df_sorted.columns.get_loc(move_col) + 1).fill = nerf_fill
+                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = nerf_fill
                             styled_cols.add(move_col)
 
                 # 4. Rework moves (purple)
                 for move in [normalize_move(m) for m in row.get("Rework", "").split(",") if m.strip()]:
                     for move_col, cell_value in move_values.items():
                         if cell_value == move:
-                            ws.cell(row=row_idx + 2, column=df_sorted.columns.get_loc(move_col) + 1).fill = rework_fill
+                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = rework_fill
                             styled_cols.add(move_col)
 
                 # 5. Moves new to Pokémon (bold only)
@@ -531,8 +576,7 @@ def main(previous_date=None):
                         if new_move not in ["(Removed)", ""]:
                             for move_col, cell_value in move_values.items():
                                 if cell_value == new_move:
-                                    ws.cell(row=row_idx + 2, column=df_sorted.columns.get_loc(move_col) + 1).font = Font(bold=True)
-
+                                    ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).font = Font(bold=True)
 
 
             # --- Type analysis sheet ---
@@ -556,30 +600,72 @@ def main(previous_date=None):
                 sheet_types = f"{league} – Types"
                 df_types.to_excel(writer, sheet_name=sheet_types, index=False)
                 ws_types = writer.sheets[sheet_types]
-                # Auto-fit + alignment
+
+                # Add date range header above types sheet
+                ws_types.insert_rows(1)
+                header_range_types = f"A1:{get_column_letter(ws_types.max_column)}1"
+                ws_types.merge_cells(header_range_types)
+                ws_types["A1"].value = f"{league} – Types – {previous_commit_date} to {latest_commit_date}"
+                ws_types["A1"].font = Font(bold=True, size=14)
+                ws_types["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+                # Format actual headers (row 2)
+                for cell in ws_types[2]:
+                    cell.font = Font(bold=True, size=12)
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+                # Auto-fit + alignment for all columns
                 for col_idx, col_cells in enumerate(ws_types.columns):
                     max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col_cells)
                     ws_types.column_dimensions[get_column_letter(col_idx + 1)].width = max_len + 5
                     for cell in col_cells:
                         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-                ws_types.auto_filter.ref = ws_types.dimensions
-                # Make each type bold
-                for row in range(2, ws_types.max_row + 1):  # skip header
+                # Filters (start from row 2)
+                ws_types.auto_filter.ref = f"A2:{get_column_letter(ws_types.max_column)}{ws_types.max_row}"
+
+                # Make Type names bold (data starts at row 3)
+                for row in range(3, ws_types.max_row + 1):
                     ws_types.cell(row=row, column=1).font = Font(bold=True)
 
-                headers = [c.value for c in ws_types[1]]
+                # Conditional formatting for numeric columns
+                headers = [c.value for c in ws_types[2]]  # header row is now row 2
                 for col_name in ["Old Ranking", "Ranking", "Difference"]:
                     if col_name in headers:
                         col_letter = get_column_letter(headers.index(col_name) + 1)
                         ws_types.conditional_formatting.add(
-                            f"{col_letter}2:{col_letter}{ws_types.max_row}",
-                            ColorScaleRule(start_type='min', start_color='FF0000',
-                                           mid_type='percentile', mid_value=50, mid_color='FFFF00',
-                                           end_type='max', end_color='00FF00')
+                            f"{col_letter}3:{col_letter}{ws_types.max_row}",  # start from data row
+                            ColorScaleRule(
+                                start_type='min', start_color='FF0000',
+                                mid_type='percentile', mid_value=50, mid_color='FFFF00',
+                                end_type='max', end_color='00FF00'
+                            )
                         )
+
 
     print(f"Excel file saved as: {latest_season_name}.xlsx")
 
 if __name__ == "__main__":
-    main(previous_date="2024-11-15T23:59:59Z")
+    import argparse
+    from datetime import datetime
+
+    parser = argparse.ArgumentParser(description="Process Pokémon ranking differences.")
+    parser.add_argument(
+        "--date", "-d",
+        type=str,
+        help='Date for previous commit in "YYYY-MM-DD" format (defaults to current data)',
+        default=None
+    )
+    args = parser.parse_args()
+
+    previous_date = None
+    if args.date:
+        try:
+            # Convert YYYY-MM-DD to YYYY-MM-DDT23:59:59Z
+            dt = datetime.strptime(args.date, "%Y-%m-%d")
+            previous_date = dt.strftime("%Y-%m-%dT23:59:59Z")
+        except ValueError:
+            print("Error: Date must be in YYYY-MM-DD format.")
+            exit(1)
+
+    main(previous_date=previous_date)
