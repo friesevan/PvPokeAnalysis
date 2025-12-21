@@ -1,0 +1,122 @@
+[
+    {
+        "buffs": [
+            "POWDER_SNOW",
+            "ICICLE_SPEAR",
+            "GEOMANCY",
+            "SHADOW_BALL",
+            "FOUL_PLAY",
+            "BRICK_BREAK",
+            "METEOR_MASH",
+            "VICE_GRIP",
+            "OBLIVION_WING"
+        ],
+        "nerfs": [
+            "DRAGON_ENERGY",
+            "SPACIAL_REND",
+            "PARABOLIC_CHARGE"
+        ],
+        "rework": [
+            "SHADOW_SNEAK"
+        ],
+        "availability_update": {
+            "URSALUNA": [
+                "SMACK_DOWN",
+                "PLAY_ROUGH"
+            ],
+            "GOGOAT": [
+                "ROCK_SLIDE"
+            ],
+            "DHELMISE": [
+                "BRUTAL_SWING"
+            ],
+            "TENTACRUEL": [
+                "PAYBACK"
+            ],
+            "HOUNDSTONE": [
+                "PLAY_ROUGH"
+            ],
+            "DOUBLADE": [
+                "SHADOW_CLAW",
+                "SACRED_SWORD"
+            ],
+            "LUDICOLO": [
+                "ASTONISH",
+                "WEATHER_BALL_WATER"
+            ],
+            "SAMUROTT_HISUIAN": [
+                "SACRED_SWORD"
+            ],
+            "KARTANA": [
+                "SACRED_SWORD",
+                "FURY_CUTTER"
+            ],
+            "CETITAN": [
+                "SUPER_POWER",
+                "ICICLE_SPEAR"
+            ],
+            "BLAZIKEN": [
+                "AURA_SPHERE",
+                "EMBER"
+            ],
+            "REGIDRAGO": [
+                "VICE_GRIP"
+            ],
+            "DUDUNSPARCE": [
+                "BODY_SLAM",
+                "DRAGON_TAIL"
+            ],
+            "MILOTIC": [
+                "AQUA_TAIL"
+            ],
+            "LUMINEON": [
+                "AQUA_TAIL"
+            ],
+            "BRONZONG": [
+                "WEATHER_BALL_WATER"
+            ],
+            "SUICUNE": [
+                "WATER_GUN"
+            ],
+            "HYDREIGON": [
+                "FLY"
+            ],
+            "GLALIE": [
+                "POWDER_SNOW"
+            ],
+            "LUNATONE": [
+                "WEATHER_BALL_ICE"
+            ],
+            "KYOGRE": [
+                "AVALANCHE"
+            ],
+            "AERODACTYL": [
+                "DRAGON_BREATH"
+            ],
+            "TYRANITAR": [
+                "DRAGON_BREATH"
+            ],
+            "LUCARIO": [
+                "METEOR_MASH"
+            ],
+            "DACHSBUN": [
+                "FIRE_FANG"
+            ],
+            "SOLROCK": [
+                "WEATHER_BALL_FIRE"
+            ],
+            "GOURGEIST_SMALL": [
+                "INCINERATE"
+            ],
+            "GOURGEIST_AVERAGE": [
+                "INCINERATE"
+            ],
+            "GOURGEIST_LARGE": [
+                "INCINERATE"
+            ],
+            "GOURGEIST_SUPER": [
+                "INCINERATE"
+            ]
+        }
+    }
+]
