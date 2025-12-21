@@ -4,14 +4,52 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.utils import get_column_letter
+import requests
 
 # ----------------------------
 # Helpers
 # ----------------------------
 
+def get_commit_sha(repo_owner, repo_name, until_date, path=None, branch="master"):
+    """
+    Returns the most recent commit SHA on or before until_date (ISO8601 string)
+    """
+    url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits"
+    params = {
+        "sha": branch,
+        "per_page": 1,
+        "until": until_date
+    }
+    if path:
+        params["path"] = path
+
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    commits = response.json()
+    if not commits:
+        raise ValueError("No commits found for that date")
+    return commits[0]["sha"]
+
 def load_json(path):
     with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
+    
+def load_json_from_github(url):
+    """
+    Load JSON from a raw GitHub URL.
+    """
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+def load_json_from_commit(path, commit_hash):
+    """
+    Load a JSON file from a specific commit.
+    path: file path relative to repo root
+    commit_hash: commit SHA string
+    """
+    url = f"https://raw.githubusercontent.com/pvpoke/pvpoke/{commit_hash}/{path}"
+    return load_json_from_github(url)
 
 def build_rankings_map(rankings):
     return {r["speciesId"]: r for r in rankings}
@@ -156,7 +194,8 @@ def get_base_species_key(pokemon_entry):
 # ----------------------------
 # League processing
 # ----------------------------
-def process_league(league, seasons, updates, pokemon_map, xl_table):
+def process_league(league, seasons, updates, pokemon_map, xl_table,
+                   rankings_current=None, rankings_previous=None):
     league_dir = os.path.join("Rankings", league)
     sorted_seasons = sorted(seasons.items(), key=lambda x: x[1])
     old_season, new_season = sorted_seasons[0][0], sorted_seasons[-1][0]
@@ -164,8 +203,8 @@ def process_league(league, seasons, updates, pokemon_map, xl_table):
     old_rankings = load_json(os.path.join(league_dir, f"{league.lower()}-{old_season}.json"))
     new_rankings = load_json(os.path.join(league_dir, f"{league.lower()}-{new_season}.json"))
 
-    old_map = build_rankings_map(old_rankings)
-    new_map = build_rankings_map(new_rankings)
+    old_map = build_rankings_map(rankings_previous[league])
+    new_map = build_rankings_map(rankings_current[league])
 
     buffed_moves = set(updates["buffs"])
     nerfed_moves = set(updates["nerfs"])
@@ -269,35 +308,94 @@ def normalize_move(move):
 # Main
 # ----------------------------
 
-def main():
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    GAME_DATA = os.path.join(BASE_DIR, "Game Data")
-    moves_data = load_json(os.path.join(GAME_DATA, "moves.json"))
+def main(previous_date=None):
 
-    global move_lookup
-    move_lookup = {
-        move["moveId"]: {
-            "name": move["name"],
-            "type": move["type"].lower()
-        }
-        for move in moves_data
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    # ----------------------------
+    # GitHub URLs
+    # ----------------------------
+    REPO_BASE = "https://raw.githubusercontent.com/pvpoke/pvpoke/master"
+
+    pokemon_url = f"{REPO_BASE}/src/data/gamemaster/pokemon.json"
+    moves_url   = f"{REPO_BASE}/src/data/gamemaster/moves.json"
+    rankings_urls = {
+        "Great": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-1500.json",
+        "Ultra": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-2500.json",
+        "Master": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-10000.json",
     }
 
-    pokemon_map = build_pokemon_map(load_json(os.path.join(GAME_DATA, "pokemon.json")))
-    xl_table = load_json(os.path.join(GAME_DATA, "xl_table.json"))
-    updates = load_json(os.path.join(BASE_DIR, "Updates", "precious-paths-update.json"))[0]
-    seasons = load_json(os.path.join(GAME_DATA, "seasons.json"))[0]
+    pokemon_data = load_json_from_github(pokemon_url) 
+    moves_data = load_json_from_github(moves_url) 
+    rankings_current = {league: load_json_from_github(url) for league, url in rankings_urls.items()}
+
+    if previous_date:
+        previous_commit = get_commit_sha(
+            repo_owner="pvpoke",
+            repo_name="pvpoke",
+            until_date=previous_date,
+            path="src/data/gamemaster/pokemon.json"
+        )
+        print("Previous commit SHA:", previous_commit)
+
+        pokemon_prev = load_json_from_commit(
+            "src/data/gamemaster/pokemon.json",
+            previous_commit
+        )
+        moves_prev = load_json_from_commit(
+            "src/data/gamemaster/moves.json",
+            previous_commit
+        )
+        rankings_prev = {
+            league: load_json_from_commit(
+                f"src/data/rankings/all/overall/rankings-{suffix}.json",
+                previous_commit
+            )
+            for league, suffix in [("Great", "1500"), ("Ultra", "2500"), ("Master", "10000")]
+        }
+    else:
+        # If no previous commit, use current data as previous
+        pokemon_prev = pokemon_data
+        moves_prev = moves_data
+        rankings_prev = rankings_current
+
+    # ----------------------------
+    # Build lookup tables
+    # ----------------------------
+    global move_lookup
+    move_lookup = {m["moveId"]: {"name": m["name"], "type": m["type"].lower()} for m in moves_data}
+    pokemon_map = {p["speciesId"]: p for p in pokemon_data}
+
+    # ----------------------------
+    # Load updates JSON (local file)
+    # ----------------------------
+    updates_path = os.path.join(BASE_DIR, "Updates", "precious-paths-update.json")
+    updates = load_json(updates_path)[0]
+
+    # ----------------------------
+    # Seasons (keep your existing seasons.json if needed)
+    # ----------------------------
+    seasons_path = os.path.join(BASE_DIR, "Game Data", "seasons.json")
+    seasons = load_json(seasons_path)[0]
 
     latest_season = max(seasons, key=seasons.get)
     latest_season_name = latest_season.replace("-", " ").title() + " Update"
     output_path = os.path.join(BASE_DIR, f"{latest_season_name}.xlsx")
-
+    xl_table = load_json(os.path.join(BASE_DIR, "Game Data", "xl_table.json"))
     leagues = ["Great", "Ultra", "Master"]
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         move_updates = collect_move_updates(updates)
         for league in leagues:
-            df = process_league(league, seasons, updates, pokemon_map, xl_table)
+            df = process_league(
+                league,
+                seasons,
+                updates,
+                pokemon_map,
+                xl_table,
+                rankings_current=rankings_current,
+                rankings_previous=rankings_prev
+            )
             if df.empty:
                 continue
 
@@ -484,4 +582,4 @@ def main():
     print(f"Excel file saved as: {latest_season_name}.xlsx")
 
 if __name__ == "__main__":
-    main()
+    main(previous_date="2024-11-15T23:59:59Z")
