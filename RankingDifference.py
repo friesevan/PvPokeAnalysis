@@ -22,7 +22,7 @@ def get_commit_date(repo_owner, repo_name, commit_sha):
     return data["commit"]["committer"]["date"]  # ISO 8601 format, e.g., "2025-12-21T18:22:03Z"
 
 
-def get_latest_commit_info(repo_owner, repo_name, path):
+def get_latest_commit_date(repo_owner, repo_name, path):
     """
     Returns the SHA and date of the latest commit for a given file path in ISO format.
     """
@@ -31,9 +31,8 @@ def get_latest_commit_info(repo_owner, repo_name, path):
     response = requests.get(url, params=params)
     response.raise_for_status()
     data = response.json()[0]  # Latest commit is first
-    sha = data["sha"]
-    date_iso = data["commit"]["committer"]["date"]  # ISO 8601 string
-    return sha, date_iso
+    date = data["commit"]["committer"]["date"]  # ISO 8601 string
+    return date
 
 def get_commit_sha(repo_owner, repo_name, until_date, path=None, branch="master"):
     """
@@ -59,28 +58,27 @@ def load_json(path):
     with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
     
-def load_json_from_github(url):
+def load_json_from_repo(path, commit_hash=None, repo="pvpoke/pvpoke", branch="master"):
     """
-    Load JSON from a raw GitHub URL.
+    Load JSON from a GitHub repo.
+
+    If commit_hash is provided → load from that commit
+    Otherwise → load from latest (branch)
+    
+    path: file path inside repo (e.g. "src/data/gamemaster/pokemon.json")
     """
+    ref = commit_hash if commit_hash else branch
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
+    
     response = requests.get(url)
     response.raise_for_status()
     return response.json()
 
-def load_json_from_commit(path, commit_hash):
-    """
-    Load a JSON file from a specific commit.
-    path: file path relative to repo root
-    commit_hash: commit SHA string
-    """
-    url = f"https://raw.githubusercontent.com/pvpoke/pvpoke/{commit_hash}/{path}"
-    return load_json_from_github(url)
-
 def build_rankings_map(rankings):
     return {r["speciesId"]: r for r in rankings}
 
-def build_pokemon_map(pokemon_data):
-    return {p["speciesId"]: p for p in pokemon_data}
+def build_pokemon_map(pokemon_current):
+    return {p["speciesId"]: p for p in pokemon_current}
 
 def stat_product(atk, defense, stamina):
     return atk * defense * stamina
@@ -177,33 +175,77 @@ def clean_moveset_change(old_moves, new_moves):
 
     return "\n".join(changes)
 
-def collect_move_updates(update_json):
-    updates = []
+def collect_move_updates(moves_old, moves_new):
+    old_map = {m["moveId"]: m for m in moves_old}
 
-    for move_id in update_json.get("buffs", []):
-        updates.append((move_id, "Buff"))
+    updates = {
+        "buffs": [],
+        "nerfs": [],
+        "reworks": [],
+        "new": []
+    }
 
-    for move_id in update_json.get("nerfs", []):
-        updates.append((move_id, "Nerf"))
+    for move in moves_new:
+        move_id = move["moveId"]
 
-    for move_id in update_json.get("rework", []):
-        updates.append((move_id, "Rework"))
+        if move_id not in old_map:
+            updates["new"].append(move_id)
+            continue
+
+        old = old_map[move_id]
+
+        old_power = old.get("power", 0)
+        new_power = move.get("power", 0)
+
+        old_energy_gain = old.get("energyGain", 0)
+        new_energy_gain = move.get("energyGain", 0)
+
+        old_energy = old.get("energy", 0)
+        new_energy = move.get("energy", 0)
+
+        buff = (
+            new_power > old_power or
+            new_energy_gain > old_energy_gain or
+            new_energy < old_energy
+        )
+
+        nerf = (
+            new_power < old_power or
+            new_energy_gain < old_energy_gain or
+            new_energy > old_energy
+        )
+
+        if buff and nerf:
+            updates["reworks"].append(move_id)
+        elif buff:
+            updates["buffs"].append(move_id)
+        elif nerf:
+            updates["nerfs"].append(move_id)
 
     return updates
 
 def build_type_update_text(pokemon_type, move_updates):
     """
     pokemon_type: 'ice', 'fire', etc.
+    move_updates: dict with keys 'buffs', 'nerfs', 'reworks', 'new'
     """
     matched_updates = []
 
-    for move_id, label in move_updates:
-        move = move_lookup.get(move_id)
-        if not move:
-            continue
+    categories = {
+        "Buff": move_updates.get("buffs", []),
+        "Nerf": move_updates.get("nerfs", []),
+        "Rework": move_updates.get("reworks", []),
+        "New": move_updates.get("new", [])
+    }
 
-        if move["type"] == pokemon_type:
-            matched_updates.append(f"{move['name']} {label}")
+    for label, move_ids in categories.items():
+        for move_id in move_ids:
+            move = move_lookup.get(move_id)
+            if not move:
+                continue
+
+            if move["type"] == pokemon_type:
+                matched_updates.append(f"{move['name']} {label}")
 
     return ", ".join(sorted(matched_updates))
 
@@ -219,22 +261,16 @@ def get_base_species_key(pokemon_entry):
 # ----------------------------
 # League processing
 # ----------------------------
-def process_league(league, seasons, updates, pokemon_map, xl_table,
+def process_league(league, move_updates, pokemon_map, pokemon_prev_map, xl_table,
                    rankings_current=None, rankings_previous=None):
-    league_dir = os.path.join("Rankings", league)
-    sorted_seasons = sorted(seasons.items(), key=lambda x: x[1])
-    old_season, new_season = sorted_seasons[0][0], sorted_seasons[-1][0]
-
-    old_rankings = load_json(os.path.join(league_dir, f"{league.lower()}-{old_season}.json"))
-    new_rankings = load_json(os.path.join(league_dir, f"{league.lower()}-{new_season}.json"))
 
     old_map = build_rankings_map(rankings_previous[league])
     new_map = build_rankings_map(rankings_current[league])
 
-    buffed_moves = set(updates["buffs"])
-    nerfed_moves = set(updates["nerfs"])
-    rework_moves = set(updates.get("rework", []))
-    availability = updates["availability_update"]
+    buffed_moves = set(move_updates["buffs"])
+    nerfed_moves = set(move_updates["nerfs"])
+    rework_moves = set(move_updates["reworks"])
+    availability = []
 
     rows = []
 
@@ -265,8 +301,25 @@ def process_league(league, seasons, updates, pokemon_map, xl_table,
         all_moveset = set(old_moveset + new_moveset)
         base_species_key = get_base_species_key(pokemon)
 
+        # Calculate New Moves
+        avail_moves = []
+        base_species_id = get_base_species_key(pokemon).lower()
+        prev_pokemon = pokemon_prev_map.get(base_species_id)
+
+        if prev_pokemon:
+            old_fast = set(prev_pokemon.get("fastMoves", []))
+            new_fast = set(pokemon.get("fastMoves", []))
+
+            old_charged = set(prev_pokemon.get("chargedMoves", []))
+            new_charged = set(pokemon.get("chargedMoves", []))
+
+            # New moves added in this update
+            new_fast_moves = new_fast - old_fast
+            new_charged_moves = new_charged - old_charged
+
+            avail_moves = sorted(new_fast_moves | new_charged_moves)
+
         # Apply move updates from the base species key (handles shadow automatically)
-        avail_moves = [m for m in availability.get(base_species_key, []) if m in new_moveset]
         buffs_used = sorted(m for m in buffed_moves if m in new_moveset)
         nerfs_used = sorted(m for m in nerfed_moves if m in old_moveset)
         reworks_used = sorted(m for m in all_moveset if m in rework_moves)
@@ -332,99 +385,110 @@ def main(previous_date=None):
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # ----------------------------
-    # GitHub URLs
+    # GitHub paths
     # ----------------------------
-    REPO_BASE = "https://raw.githubusercontent.com/pvpoke/pvpoke/master"
-
-    pokemon_url = f"{REPO_BASE}/src/data/gamemaster/pokemon.json"
-    moves_url   = f"{REPO_BASE}/src/data/gamemaster/moves.json"
-    rankings_urls = {
-        "Great": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-1500.json",
-        "Ultra": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-2500.json",
-        "Master": f"{REPO_BASE}/src/data/rankings/all/overall/rankings-10000.json",
+    RANKING_PATHS = {
+        "Great": "src/data/rankings/all/overall/rankings-1500.json",
+        "Ultra": "src/data/rankings/all/overall/rankings-2500.json",
+        "Master": "src/data/rankings/all/overall/rankings-10000.json",
     }
 
-    pokemon_data = load_json_from_github(pokemon_url) 
-    moves_data = load_json_from_github(moves_url) 
-    rankings_current = {league: load_json_from_github(url) for league, url in rankings_urls.items()}
+    # ----------------------------
+    # Current data (latest)
+    # ----------------------------
+    pokemon_current = load_json_from_repo("src/data/gamemaster/pokemon.json")
+    moves_current = load_json_from_repo("src/data/gamemaster/moves.json")
 
-    # Latest commit date (we assume master branch latest)
-    latest_commit_sha, latest_commit_date_iso = get_latest_commit_info(
+    rankings_current = {
+        league: load_json_from_repo(path)
+        for league, path in RANKING_PATHS.items()
+    }
+
+    # ----------------------------
+    # Latest commit date
+    # ----------------------------
+    latest_commit_iso = get_latest_commit_date(
         repo_owner="pvpoke",
         repo_name="pvpoke",
         path="src/data/gamemaster/pokemon.json"
     )
-    latest_commit_date = datetime.strptime(latest_commit_date_iso[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+    latest_commit_date = datetime.strptime(
+        latest_commit_iso[:10], "%Y-%m-%d"
+    ).strftime("%m/%d/%Y")
 
-    previous_commit_date = None
-    rankings_prev = {}
+    # ----------------------------
+    # Previous snapshot (if provided)
+    # ----------------------------
     if previous_date:
+        # ✅ Use ONE commit SHA for consistency
         previous_commit_sha = get_commit_sha(
             repo_owner="pvpoke",
             repo_name="pvpoke",
             until_date=previous_date,
             path="src/data/gamemaster/pokemon.json"
         )
-        # Pull actual commit date for previous SHA
-        previous_commit_date_iso = get_commit_date(
+
+        # ✅ Get actual commit date
+        previous_commit_iso = get_commit_date(
             repo_owner="pvpoke",
             repo_name="pvpoke",
             commit_sha=previous_commit_sha
         )
-        previous_commit_date = datetime.strptime(previous_commit_date_iso[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
+        previous_commit_date = datetime.strptime(
+            previous_commit_iso[:10], "%Y-%m-%d"
+        ).strftime("%m/%d/%Y")
 
-        pokemon_prev = load_json_from_commit("src/data/gamemaster/pokemon.json", previous_commit_sha)
-        moves_prev   = load_json_from_commit("src/data/gamemaster/moves.json", previous_commit_sha)
+        # Load previous data (same commit!)
         rankings_prev = {
-            league: load_json_from_commit(
-                f"src/data/rankings/all/overall/rankings-{suffix}.json",
-                previous_commit_sha
-            )
-            for league, suffix in [("Great", "1500"), ("Ultra", "2500"), ("Master", "10000")]
+            league: load_json_from_repo(path, commit_hash=previous_commit_sha)
+            for league, path in RANKING_PATHS.items()
         }
-    else:
-        previous_commit_date = latest_commit_date  # if no previous, same as latest
-        pokemon_prev = pokemon_data
-        moves_prev   = moves_data
-        rankings_prev = rankings_current
 
+        moves_prev = load_json_from_repo(
+            "src/data/gamemaster/moves.json",
+            commit_hash=previous_commit_sha
+        )
+        pokemon_prev = load_json_from_repo(
+            "src/data/gamemaster/pokemon.json",
+            commit_hash=previous_commit_sha
+        )
+
+    else:
+        previous_commit_date = latest_commit_date
+        rankings_prev = rankings_current
+        moves_prev = moves_current
+        pokemon_prev = pokemon_current
 
     # ----------------------------
-    # Build lookup tables
+    # Lookups
     # ----------------------------
     global move_lookup
-    move_lookup = {m["moveId"]: {"name": m["name"], "type": m["type"].lower()} for m in moves_data}
-    pokemon_map = {p["speciesId"]: p for p in pokemon_data}
+    move_lookup = {
+        m["moveId"]: {"name": m["name"], "type": m["type"].lower()}
+        for m in moves_current
+    }
 
-    # ----------------------------
-    # Load updates JSON (local file)
-    # ----------------------------
-    updates_path = os.path.join(BASE_DIR, "Updates", "precious-paths-update.json")
-    updates = load_json(updates_path)[0]
+    pokemon_map = {p["speciesId"]: p for p in pokemon_current}
+    pokemon_prev_map = {p["speciesId"]: p for p in pokemon_prev}
 
-    # ----------------------------
-    # Seasons (keep your existing seasons.json if needed)
-    # ----------------------------
-    seasons_path = os.path.join(BASE_DIR, "Game Data", "seasons.json")
-    seasons = load_json(seasons_path)[0]
-
-    latest_season = max(seasons, key=seasons.get)
-    latest_season_name = latest_season.replace("-", " ").title() + " Update"
-    output_path = os.path.join(BASE_DIR, f"{latest_season_name}.xlsx")
+    output_path = os.path.join(BASE_DIR, "Pokemon GBL Analyzer.xlsx")
     xl_table = load_json(os.path.join(BASE_DIR, "Game Data", "xl_table.json"))
+
     leagues = ["Great", "Ultra", "Master"]
 
+    # ✅ NEW: computed move updates
+    move_updates = collect_move_updates(moves_prev, moves_current)
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        move_updates = collect_move_updates(updates)
         for league in leagues:
             df = process_league(
-                league,
-                seasons,
-                updates,
-                pokemon_map,
-                xl_table,
-                rankings_current=rankings_current,
-                rankings_previous=rankings_prev
+                    league,
+                    move_updates,   # ✅ pass this instead
+                    pokemon_map,
+                    pokemon_prev_map,
+                    xl_table,
+                    rankings_current=rankings_current,
+                    rankings_previous=rankings_prev
             )
             if df.empty:
                 continue
@@ -523,52 +587,46 @@ def main(previous_date=None):
             append_average_row(ws, df_sorted, header_row=2)
 
             
-            new_move_fill = PatternFill(start_color="A8D5BA", end_color="A8D5BA", fill_type="solid")   # soft green
-            rework_fill   = PatternFill(start_color="C6A3C6", end_color="C6A3C6", fill_type="solid")   # muted purple
-            buff_fill     = PatternFill(start_color="A3C4F3", end_color="A3C4F3", fill_type="solid")   # muted blue
-            nerf_fill     = PatternFill(start_color="F4A3A3", end_color="F4A3A3", fill_type="solid")   # soft red
+            buff_fill   = PatternFill(start_color="A8D5BA", end_color="A8D5BA", fill_type="solid")  # Green
+            nerf_fill   = PatternFill(start_color="F4A3A3", end_color="F4A3A3", fill_type="solid")  # Red
+            rework_fill =PatternFill(start_color="A3C4F3", end_color="A3C4F3", fill_type="solid")  # Blue
 
             # Highlight moves with debug prints (adjusted for date header)
+            new_moves_global = set(move_updates["new"])
             for row_idx, row in df_sorted.iterrows():
-                styled_cols = set()
 
-                # Normalize all move column values
-                move_values = {col: normalize_move(row.get(col, "")) for col in ["Fast Move", "Charged Move 1", "Charged Move 2"]}
+                move_values = {
+                    col: normalize_move(row.get(col, ""))
+                    for col in ["Fast Move", "Charged Move 1", "Charged Move 2"]
+                }
 
-                # Data now starts at Excel row 3 because of date header + header row
                 excel_row = row_idx + 3
 
-                # 2. Buffed moves (blue)
-                for move in [normalize_move(m) for m in row.get("Buffs", "").split(",") if m.strip()]:
-                    for move_col, cell_value in move_values.items():
-                        if cell_value == move:
-                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = buff_fill
-                            styled_cols.add(move_col)
+                buffs = {normalize_move(m) for m in row.get("Buffs", "").split(",") if m.strip()}
+                nerfs = {normalize_move(m) for m in row.get("Nerfs", "").split(",") if m.strip()}
+                reworks = {normalize_move(m) for m in row.get("Rework", "").split(",") if m.strip()}
+                new_to_pokemon = {
+                    normalize_move(format_move_name(m))
+                    for m in move_updates["new"]
+                }
 
-                # 1. Newly added moves (green + bold)
-                for move in [normalize_move(m) for m in row.get("Attack Availability", "").split(",") if m.strip()]:
-                    for move_col, cell_value in move_values.items():
-                        if cell_value == move:
-                            cell = ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1)
-                            cell.fill = new_move_fill
-                            cell.font = Font(bold=True)
-                            styled_cols.add(move_col)
+                # --- 1. Apply color coding (Buff/Nerf/Rework) ---
+                for move_col, cell_value in move_values.items():
+                    if not cell_value:
+                        continue
 
-                # 3. Nerfed moves (red)
-                for move in [normalize_move(m) for m in row.get("Nerfs", "").split(",") if m.strip()]:
-                    for move_col, cell_value in move_values.items():
-                        if cell_value == move:
-                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = nerf_fill
-                            styled_cols.add(move_col)
+                    cell = ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1)
 
-                # 4. Rework moves (purple)
-                for move in [normalize_move(m) for m in row.get("Rework", "").split(",") if m.strip()]:
-                    for move_col, cell_value in move_values.items():
-                        if cell_value == move:
-                            ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).fill = rework_fill
-                            styled_cols.add(move_col)
+                    if cell_value in buffs:
+                        cell.fill = buff_fill
 
-                # 5. Moves new to Pokémon (bold only)
+                    elif cell_value in nerfs:
+                        cell.fill = nerf_fill
+
+                    elif cell_value in reworks:
+                        cell.fill = rework_fill
+
+                # --- 2. Bold: New to moveset ---
                 for line in row.get("Moveset Change", "").split("\n"):
                     parts = line.split("→")
                     if len(parts) == 2:
@@ -576,7 +634,22 @@ def main(previous_date=None):
                         if new_move not in ["(Removed)", ""]:
                             for move_col, cell_value in move_values.items():
                                 if cell_value == new_move:
-                                    ws.cell(row=excel_row, column=df_sorted.columns.get_loc(move_col) + 1).font = Font(bold=True)
+                                    ws.cell(
+                                        row=excel_row,
+                                        column=df_sorted.columns.get_loc(move_col) + 1
+                                    ).font = Font(bold=True)
+
+                # --- 3. Bold + ALL CAPS: New to Pokémon ---
+                for move_col, cell_value in move_values.items():
+                    if cell_value in new_to_pokemon:
+                        col_idx = df_sorted.columns.get_loc(move_col) + 1
+                        cell = ws.cell(row=excel_row, column=col_idx)
+
+                        # ALL CAPS
+                        cell.value = cell_value.upper()
+
+                        # Bold
+                        cell.font = Font(bold=True)
 
 
             # --- Type analysis sheet ---
@@ -643,7 +716,7 @@ def main(previous_date=None):
                         )
 
 
-    print(f"Excel file saved as: {latest_season_name}.xlsx")
+    print(f"Excel file saved as: Pokemon GBL Analyzer.xlsx")
 
 if __name__ == "__main__":
     import argparse
