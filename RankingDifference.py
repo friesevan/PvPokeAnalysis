@@ -22,12 +22,12 @@ def get_commit_date(repo_owner, repo_name, commit_sha):
     return data["commit"]["committer"]["date"]  # ISO 8601 format, e.g., "2025-12-21T18:22:03Z"
 
 
-def get_latest_commit_date(repo_owner, repo_name, path):
+def get_latest_commit_date(repo_owner, repo_name, path, branch="master"):
     """
     Returns the SHA and date of the latest commit for a given file path in ISO format.
     """
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits"
-    params = {"path": path, "per_page": 1}  # Only need the latest commit
+    params = {"path": path, "per_page": 1, "sha": branch}  # Only need the latest commit
     response = requests.get(url, params=params)
     response.raise_for_status()
     data = response.json()[0]  # Latest commit is first
@@ -380,7 +380,17 @@ def normalize_move(move):
 # Main
 # ----------------------------
 
-def main(previous_date=None):
+def main(previous_date=None, current_branch="master", previous_branch=None):
+    """
+    Args:
+        previous_date:    ISO8601 cutoff date for the previous snapshot (optional).
+        current_branch:   Branch name to use for the current (present) data.
+        previous_branch:  Branch name to use for the previous snapshot.
+                          Defaults to current_branch when not specified.
+    """
+    # Default previous_branch to match current_branch when not explicitly set
+    if previous_branch is None:
+        previous_branch = current_branch
 
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -394,51 +404,57 @@ def main(previous_date=None):
     }
 
     # ----------------------------
-    # Current data (latest)
+    # Current data (latest on current_branch)
     # ----------------------------
-    pokemon_current = load_json_from_repo("src/data/gamemaster/pokemon.json")
-    moves_current = load_json_from_repo("src/data/gamemaster/moves.json")
+    pokemon_current = load_json_from_repo(
+        "src/data/gamemaster/pokemon.json", branch=current_branch
+    )
+    moves_current = load_json_from_repo(
+        "src/data/gamemaster/moves.json", branch=current_branch
+    )
 
     rankings_current = {
-        league: load_json_from_repo(path)
+        league: load_json_from_repo(path, branch=current_branch)
         for league, path in RANKING_PATHS.items()
     }
 
     # ----------------------------
-    # Latest commit date
+    # Latest commit date (on current_branch)
     # ----------------------------
     latest_commit_iso = get_latest_commit_date(
         repo_owner="pvpoke",
         repo_name="pvpoke",
-        path="src/data/gamemaster/pokemon.json"
+        path="src/data/gamemaster/pokemon.json",
+        branch=current_branch,
     )
     latest_commit_date = datetime.strptime(
         latest_commit_iso[:10], "%Y-%m-%d"
     ).strftime("%m/%d/%Y")
 
     # ----------------------------
-    # Previous snapshot (if provided)
+    # Previous snapshot
     # ----------------------------
     if previous_date:
-        # ✅ Use ONE commit SHA for consistency
+        # Use ONE commit SHA for consistency, scoped to previous_branch
         previous_commit_sha = get_commit_sha(
             repo_owner="pvpoke",
             repo_name="pvpoke",
             until_date=previous_date,
-            path="src/data/gamemaster/pokemon.json"
+            path="src/data/gamemaster/pokemon.json",
+            branch=previous_branch,
         )
 
-        # ✅ Get actual commit date
+        # Get actual commit date
         previous_commit_iso = get_commit_date(
             repo_owner="pvpoke",
             repo_name="pvpoke",
-            commit_sha=previous_commit_sha
+            commit_sha=previous_commit_sha,
         )
         previous_commit_date = datetime.strptime(
             previous_commit_iso[:10], "%Y-%m-%d"
         ).strftime("%m/%d/%Y")
 
-        # Load previous data (same commit!)
+        # Load previous data from that commit
         rankings_prev = {
             league: load_json_from_repo(path, commit_hash=previous_commit_sha)
             for league, path in RANKING_PATHS.items()
@@ -446,18 +462,42 @@ def main(previous_date=None):
 
         moves_prev = load_json_from_repo(
             "src/data/gamemaster/moves.json",
-            commit_hash=previous_commit_sha
+            commit_hash=previous_commit_sha,
         )
         pokemon_prev = load_json_from_repo(
             "src/data/gamemaster/pokemon.json",
-            commit_hash=previous_commit_sha
+            commit_hash=previous_commit_sha,
         )
 
     else:
-        previous_commit_date = latest_commit_date
-        rankings_prev = rankings_current
-        moves_prev = moves_current
-        pokemon_prev = pokemon_current
+        # No date supplied — compare previous_branch HEAD vs current_branch HEAD
+        if previous_branch != current_branch:
+            previous_commit_iso = get_latest_commit_date(
+                repo_owner="pvpoke",
+                repo_name="pvpoke",
+                path="src/data/gamemaster/pokemon.json",
+                branch=previous_branch,
+            )
+            previous_commit_date = datetime.strptime(
+                previous_commit_iso[:10], "%Y-%m-%d"
+            ).strftime("%m/%d/%Y")
+
+            rankings_prev = {
+                league: load_json_from_repo(path, branch=previous_branch)
+                for league, path in RANKING_PATHS.items()
+            }
+            moves_prev = load_json_from_repo(
+                "src/data/gamemaster/moves.json", branch=previous_branch
+            )
+            pokemon_prev = load_json_from_repo(
+                "src/data/gamemaster/pokemon.json", branch=previous_branch
+            )
+        else:
+            # Same branch, no date → no-op comparison (identical snapshots)
+            previous_commit_date = latest_commit_date
+            rankings_prev = rankings_current
+            moves_prev = moves_current
+            pokemon_prev = pokemon_current
 
     # ----------------------------
     # Lookups
@@ -476,14 +516,14 @@ def main(previous_date=None):
 
     leagues = ["Great", "Ultra", "Master"]
 
-    # ✅ NEW: computed move updates
+    # Computed move updates
     move_updates = collect_move_updates(moves_prev, moves_current)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         for league in leagues:
             df = process_league(
                     league,
-                    move_updates,   # ✅ pass this instead
+                    move_updates,
                     pokemon_map,
                     pokemon_prev_map,
                     xl_table,
@@ -589,9 +629,9 @@ def main(previous_date=None):
             
             buff_fill   = PatternFill(start_color="A8D5BA", end_color="A8D5BA", fill_type="solid")  # Green
             nerf_fill   = PatternFill(start_color="F4A3A3", end_color="F4A3A3", fill_type="solid")  # Red
-            rework_fill =PatternFill(start_color="A3C4F3", end_color="A3C4F3", fill_type="solid")  # Blue
+            rework_fill = PatternFill(start_color="A3C4F3", end_color="A3C4F3", fill_type="solid")  # Blue
 
-            # Highlight moves with debug prints (adjusted for date header)
+            # Highlight moves (adjusted for date header)
             new_moves_global = set(move_updates["new"])
             for row_idx, row in df_sorted.iterrows():
 
@@ -726,7 +766,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--date", "-d",
         type=str,
-        help='Date for previous commit in "YYYY-MM-DD" format (defaults to current data)',
+        help='Date for previous snapshot in "YYYY-MM-DD" format (defaults to current data)',
+        default=None
+    )
+    parser.add_argument(
+        "--branch", "-b",
+        type=str,
+        help='Branch name to use for the current (present) data (default: master)',
+        default="master"
+    )
+    parser.add_argument(
+        "--prev-branch", "-pb",
+        type=str,
+        help='Branch name to use for the previous snapshot (defaults to --branch)',
         default=None
     )
     args = parser.parse_args()
@@ -741,4 +793,8 @@ if __name__ == "__main__":
             print("Error: Date must be in YYYY-MM-DD format.")
             exit(1)
 
-    main(previous_date=previous_date)
+    main(
+        previous_date=previous_date,
+        current_branch=args.branch,
+        previous_branch=args.prev_branch,  # None → defaults to current_branch inside main()
+    )
