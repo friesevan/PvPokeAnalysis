@@ -259,6 +259,62 @@ def get_base_species_key(pokemon_entry):
 
 
 # ----------------------------
+# Cup / ranking path resolution
+# ----------------------------
+
+# Maps ranking filename → (league name, CP cap)
+RANKING_FILE_TO_LEAGUE = {
+    "rankings-1500": "Great",
+    "rankings-2500": "Ultra",
+    "rankings-10000": "Master",
+}
+
+def build_ranking_paths(cup):
+    """
+    Return a dict of {league_name: repo_path} for all ranking files that exist
+    under the given cup folder on the pvpoke master branch.
+
+    For the standard 'all' cup we always include all three leagues.
+    For other cups we probe the GitHub API to discover which ranking files
+    actually exist so we only process leagues the cup supports.
+    """
+    base = f"src/data/rankings/{cup}/overall"
+
+    if cup == "all":
+        # Standard cup — all three leagues guaranteed
+        return {
+            league: f"{base}/{filename}.json"
+            for filename, league in RANKING_FILE_TO_LEAGUE.items()
+        }
+
+    # Probe for available ranking files in the cup folder
+    api_url = f"https://api.github.com/repos/pvpoke/pvpoke/contents/{base}"
+    response = requests.get(api_url)
+
+    if response.status_code == 404:
+        raise ValueError(
+            f"Cup folder not found on GitHub: {base}\n"
+            f"Make sure '--cup {cup}' matches an existing folder under src/data/rankings/."
+        )
+    response.raise_for_status()
+
+    contents = response.json()
+    found = {}
+    for item in contents:
+        name_no_ext = item["name"].replace(".json", "")
+        if name_no_ext in RANKING_FILE_TO_LEAGUE:
+            league = RANKING_FILE_TO_LEAGUE[name_no_ext]
+            found[league] = f"{base}/{item['name']}"
+
+    if not found:
+        raise ValueError(
+            f"No recognised ranking files (rankings-1500/2500/10000.json) found in {base}."
+        )
+
+    return found
+
+
+# ----------------------------
 # League processing
 # ----------------------------
 def process_league(league, move_updates, pokemon_map, pokemon_prev_map, xl_table,
@@ -380,124 +436,113 @@ def normalize_move(move):
 # Main
 # ----------------------------
 
-def main(previous_date=None, current_branch="master", previous_branch=None):
+def main(previous_date=None, current_date=None, current_branch="master", previous_branch=None,
+         current_cup="all", previous_cup=None):
     """
     Args:
         previous_date:    ISO8601 cutoff date for the previous snapshot (optional).
+        current_date:     ISO8601 cutoff date for the current snapshot (optional).
+                          When omitted, the latest commit on current_branch is used.
         current_branch:   Branch name to use for the current (present) data.
         previous_branch:  Branch name to use for the previous snapshot.
                           Defaults to current_branch when not specified.
+        current_cup:      Cup/folder name for the current rankings (default: 'all').
+        previous_cup:     Cup/folder name for the previous rankings.
+                          Defaults to current_cup when not specified.
     """
     # Default previous_branch to match current_branch when not explicitly set
     if previous_branch is None:
         previous_branch = current_branch
 
+    # Default previous_cup to match current_cup when not explicitly set
+    if previous_cup is None:
+        previous_cup = current_cup
+
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
     # ----------------------------
-    # GitHub paths
+    # Resolve ranking paths for each cup
     # ----------------------------
-    RANKING_PATHS = {
-        "Great": "src/data/rankings/all/overall/rankings-1500.json",
-        "Ultra": "src/data/rankings/all/overall/rankings-2500.json",
-        "Master": "src/data/rankings/all/overall/rankings-10000.json",
-    }
+    ranking_paths_current = build_ranking_paths(current_cup)
+    ranking_paths_previous = build_ranking_paths(previous_cup)
 
-    # ----------------------------
-    # Current data (latest on current_branch)
-    # ----------------------------
-    pokemon_current = load_json_from_repo(
-        "src/data/gamemaster/pokemon.json", branch=current_branch
-    )
-    moves_current = load_json_from_repo(
-        "src/data/gamemaster/moves.json", branch=current_branch
+    # We only process leagues that exist in BOTH cups
+    shared_leagues = sorted(
+        set(ranking_paths_current.keys()) & set(ranking_paths_previous.keys()),
+        key=lambda l: ["Great", "Ultra", "Master"].index(l)
     )
 
-    rankings_current = {
-        league: load_json_from_repo(path, branch=current_branch)
-        for league, path in RANKING_PATHS.items()
-    }
+    if not shared_leagues:
+        raise ValueError(
+            f"No overlapping leagues found between cup '{current_cup}' "
+            f"and cup '{previous_cup}'. Cannot compare."
+        )
 
     # ----------------------------
-    # Latest commit date (on current_branch)
+    # Current data
     # ----------------------------
-    latest_commit_iso = get_latest_commit_date(
+    current_commit_sha = get_commit_sha(
         repo_owner="pvpoke",
         repo_name="pvpoke",
+        until_date=current_date,
         path="src/data/gamemaster/pokemon.json",
         branch=current_branch,
     )
+    current_commit_iso = get_commit_date(
+        repo_owner="pvpoke",
+        repo_name="pvpoke",
+        commit_sha=current_commit_sha,
+    )
     latest_commit_date = datetime.strptime(
-        latest_commit_iso[:10], "%Y-%m-%d"
+        current_commit_iso[:10], "%Y-%m-%d"
     ).strftime("%m/%d/%Y")
+
+    pokemon_current = load_json_from_repo(
+        "src/data/gamemaster/pokemon.json", commit_hash=current_commit_sha
+    )
+    moves_current = load_json_from_repo(
+        "src/data/gamemaster/moves.json", commit_hash=current_commit_sha
+    )
+    rankings_current = {
+        league: load_json_from_repo(
+            ranking_paths_current[league], commit_hash=current_commit_sha
+        )
+        for league in shared_leagues
+    }
 
     # ----------------------------
     # Previous snapshot
     # ----------------------------
-    if previous_date:
-        # Use ONE commit SHA for consistency, scoped to previous_branch
-        previous_commit_sha = get_commit_sha(
-            repo_owner="pvpoke",
-            repo_name="pvpoke",
-            until_date=previous_date,
-            path="src/data/gamemaster/pokemon.json",
-            branch=previous_branch,
+    previous_commit_sha = get_commit_sha(
+        repo_owner="pvpoke",
+        repo_name="pvpoke",
+        until_date=previous_date,
+        path="src/data/gamemaster/pokemon.json",
+        branch=previous_branch,
+    )
+    previous_commit_iso = get_commit_date(
+        repo_owner="pvpoke",
+        repo_name="pvpoke",
+        commit_sha=previous_commit_sha,
+    )
+    previous_commit_date = datetime.strptime(
+        previous_commit_iso[:10], "%Y-%m-%d"
+    ).strftime("%m/%d/%Y")
+
+    rankings_prev = {
+        league: load_json_from_repo(
+            ranking_paths_previous[league], commit_hash=previous_commit_sha
         )
-
-        # Get actual commit date
-        previous_commit_iso = get_commit_date(
-            repo_owner="pvpoke",
-            repo_name="pvpoke",
-            commit_sha=previous_commit_sha,
-        )
-        previous_commit_date = datetime.strptime(
-            previous_commit_iso[:10], "%Y-%m-%d"
-        ).strftime("%m/%d/%Y")
-
-        # Load previous data from that commit
-        rankings_prev = {
-            league: load_json_from_repo(path, commit_hash=previous_commit_sha)
-            for league, path in RANKING_PATHS.items()
-        }
-
-        moves_prev = load_json_from_repo(
-            "src/data/gamemaster/moves.json",
-            commit_hash=previous_commit_sha,
-        )
-        pokemon_prev = load_json_from_repo(
-            "src/data/gamemaster/pokemon.json",
-            commit_hash=previous_commit_sha,
-        )
-
-    else:
-        # No date supplied — compare previous_branch HEAD vs current_branch HEAD
-        if previous_branch != current_branch:
-            previous_commit_iso = get_latest_commit_date(
-                repo_owner="pvpoke",
-                repo_name="pvpoke",
-                path="src/data/gamemaster/pokemon.json",
-                branch=previous_branch,
-            )
-            previous_commit_date = datetime.strptime(
-                previous_commit_iso[:10], "%Y-%m-%d"
-            ).strftime("%m/%d/%Y")
-
-            rankings_prev = {
-                league: load_json_from_repo(path, branch=previous_branch)
-                for league, path in RANKING_PATHS.items()
-            }
-            moves_prev = load_json_from_repo(
-                "src/data/gamemaster/moves.json", branch=previous_branch
-            )
-            pokemon_prev = load_json_from_repo(
-                "src/data/gamemaster/pokemon.json", branch=previous_branch
-            )
-        else:
-            # Same branch, no date → no-op comparison (identical snapshots)
-            previous_commit_date = latest_commit_date
-            rankings_prev = rankings_current
-            moves_prev = moves_current
-            pokemon_prev = pokemon_current
+        for league in shared_leagues
+    }
+    moves_prev = load_json_from_repo(
+        "src/data/gamemaster/moves.json",
+        commit_hash=previous_commit_sha,
+    )
+    pokemon_prev = load_json_from_repo(
+        "src/data/gamemaster/pokemon.json",
+        commit_hash=previous_commit_sha,
+    )
 
     # ----------------------------
     # Lookups
@@ -514,13 +559,23 @@ def main(previous_date=None, current_branch="master", previous_branch=None):
     output_path = os.path.join(BASE_DIR, "Pokemon GBL Analyzer.xlsx")
     xl_table = load_json(os.path.join(BASE_DIR, "Game Data", "xl_table.json"))
 
-    leagues = ["Great", "Ultra", "Master"]
+    # ----------------------------
+    # Build a display label for the cup comparison
+    # ----------------------------
+    def cup_label(cup):
+        return cup.replace("-", " ").replace("_", " ").title()
+
+    cup_display = (
+        f"{cup_label(previous_cup)} → {cup_label(current_cup)}"
+        if previous_cup != current_cup
+        else cup_label(current_cup)
+    )
 
     # Computed move updates
     move_updates = collect_move_updates(moves_prev, moves_current)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        for league in leagues:
+        for league in shared_leagues:
             df = process_league(
                     league,
                     move_updates,
@@ -579,7 +634,9 @@ def main(previous_date=None, current_branch="master", previous_branch=None):
             ws.insert_rows(1)  # insert new first row
             header_range = f"A1:{get_column_letter(ws.max_column)}1"
             ws.merge_cells(header_range)
-            ws["A1"].value = f"{league} – Pokemon – {previous_commit_date} to {latest_commit_date}"
+            ws["A1"].value = (
+                f"{league} – {cup_display} – {previous_commit_date} to {latest_commit_date}"
+            )
             ws["A1"].font = Font(bold=True, size=14)
             ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
@@ -718,7 +775,9 @@ def main(previous_date=None, current_branch="master", previous_branch=None):
                 ws_types.insert_rows(1)
                 header_range_types = f"A1:{get_column_letter(ws_types.max_column)}1"
                 ws_types.merge_cells(header_range_types)
-                ws_types["A1"].value = f"{league} – Types – {previous_commit_date} to {latest_commit_date}"
+                ws_types["A1"].value = (
+                    f"{league} – Types – {cup_display} – {previous_commit_date} to {latest_commit_date}"
+                )
                 ws_types["A1"].font = Font(bold=True, size=14)
                 ws_types["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
@@ -766,7 +825,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--date", "-d",
         type=str,
-        help='Date for previous snapshot in "YYYY-MM-DD" format (defaults to current data)',
+        help='Cutoff date for the current snapshot in "YYYY-MM-DD" format (defaults to today)',
+        default=None
+    )
+    parser.add_argument(
+        "--prev-date", "-pd",
+        type=str,
+        help='Cutoff date for the previous snapshot in "YYYY-MM-DD" format (defaults to today)',
         default=None
     )
     parser.add_argument(
@@ -781,20 +846,49 @@ if __name__ == "__main__":
         help='Branch name to use for the previous snapshot (defaults to --branch)',
         default=None
     )
+    parser.add_argument(
+        "--cup", "-c",
+        type=str,
+        help=(
+            'Cup folder name for the current rankings '
+            '(e.g. "sunshine", "remix", "all"). '
+            'Determines which leagues are processed based on the ranking files present. '
+            'Default: "all"'
+        ),
+        default="all"
+    )
+    parser.add_argument(
+        "--prev-cup", "-pc",
+        type=str,
+        help=(
+            'Cup folder name for the previous/baseline rankings '
+            '(e.g. "all", "remix"). '
+            'Defaults to the value of --cup when not specified.'
+        ),
+        default=None
+    )
     args = parser.parse_args()
 
-    previous_date = None
-    if args.date:
+    today = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
+
+    def parse_date(value, flag):
+        if not value:
+            return today
         try:
-            # Convert YYYY-MM-DD to YYYY-MM-DDT23:59:59Z
-            dt = datetime.strptime(args.date, "%Y-%m-%d")
-            previous_date = dt.strftime("%Y-%m-%dT23:59:59Z")
+            dt = datetime.strptime(value, "%Y-%m-%d")
+            return dt.strftime("%Y-%m-%dT23:59:59Z")
         except ValueError:
-            print("Error: Date must be in YYYY-MM-DD format.")
+            print(f"Error: {flag} must be in YYYY-MM-DD format.")
             exit(1)
+
+    previous_date = parse_date(args.prev_date, "--prev-date")
+    current_date  = parse_date(args.date,      "--date")
 
     main(
         previous_date=previous_date,
+        current_date=current_date,
         current_branch=args.branch,
-        previous_branch=args.prev_branch,  # None → defaults to current_branch inside main()
+        previous_branch=args.prev_branch,   # None → defaults to current_branch inside main()
+        current_cup=args.cup,
+        previous_cup=args.prev_cup,         # None → defaults to current_cup inside main()
     )
